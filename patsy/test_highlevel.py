@@ -997,3 +997,174 @@ def test_NAActioon_pandas_string_index():
     dm2 = dmatrix(di, data2, 0, return_type="dataframe")
     assert np.allclose(dm2, [[1.0, 6.0, 4.0], [1.0, 7.0, 5.0]])
     assert list(dm2.columns) == ["Intercept", "x", "z"]
+
+
+def test_scalar_broadcast_highlevel():
+    # Numeric scalars broadcast exactly like explicit repetition:
+    m = dmatrix("x + rate", {"x": [1, 2, 3], "rate": 1.5}, scalar_broadcast=True)
+    m_ref = dmatrix("x + rate", {"x": [1, 2, 3], "rate": [1.5, 1.5, 1.5]})
+    assert m.design_info.column_names == m_ref.design_info.column_names
+    assert np.allclose(m, m_ref)
+    # ...in sums and interactions with per-row factors:
+    m = dmatrix("x * rate", {"x": [1, 2, 3], "rate": 2.0}, scalar_broadcast=True)
+    m_ref = dmatrix("x * rate", {"x": [1, 2, 3], "rate": [2.0, 2.0, 2.0]})
+    assert m.design_info.column_names == m_ref.design_info.column_names
+    assert np.allclose(m, m_ref)
+    # Categorical scalars (via C() or bare strings) and boolean scalars:
+    m = dmatrix(
+        "x + C(tag, levels=['a', 'b']) + flag",
+        {"x": [1, 2, 3], "tag": "b", "flag": True},
+        scalar_broadcast=True,
+    )
+    m_ref = dmatrix(
+        "x + C(tag, levels=['a', 'b']) + flag",
+        {"x": [1, 2, 3], "tag": ["b", "b", "b"], "flag": [True, True, True]},
+    )
+    assert m.design_info.column_names == m_ref.design_info.column_names
+    assert np.allclose(m, m_ref)
+    # Scalar responses work too, with NA/index handling shared as usual:
+    y, X = dmatrices(
+        "y ~ x + rate",
+        {"y": 2.0, "x": [1, 2, 3], "rate": 0.5},
+        scalar_broadcast=True,
+    )
+    assert y.shape == (3, 1)
+    assert np.allclose(y, 2.0)
+    assert X.shape == (3, 3)
+    # The setting is recorded on the design info, and the row count is
+    # re-determined from each new batch of data:
+    di = X.design_info
+    assert di.scalar_broadcast is True
+    X2 = build_design_matrices([di], {"x": [1, 2, 3, 4], "rate": 1.5})[0]
+    assert X2.shape == (4, 3)
+    assert np.allclose(np.asarray(X2)[:, 2], 1.5)
+    # ...and term subsets keep it:
+    sub = di.subset("0 + x + rate")
+    assert sub.scalar_broadcast is True
+    X3 = build_design_matrices([sub], {"x": [1, 2], "rate": 3.5})[0]
+    assert np.allclose(X3, [[1, 3.5], [2, 3.5]])
+
+
+def test_scalar_broadcast_errors():
+    # All-scalar data with no DataFrame: row count cannot be determined.
+    pytest.raises(
+        PatsyError,
+        dmatrix,
+        "x1 + x2",
+        {"x1": 1.1, "x2": 1.2},
+        scalar_broadcast=True,
+    )
+    # 1-element arrays and 1-row matrices are not scalars, and still follow
+    # the ordinary row-count rules:
+    pytest.raises(
+        PatsyError,
+        dmatrix,
+        "x + rate",
+        {"x": [1, 2, 3], "rate": [1.5]},
+        scalar_broadcast=True,
+    )
+    pytest.raises(
+        PatsyError,
+        dmatrix,
+        "x + rate",
+        {"x": [1, 2, 3], "rate": [[1.5]]},
+        scalar_broadcast=True,
+    )
+    # The default mode is unchanged: scalars don't broadcast without the flag.
+    pytest.raises(PatsyError, dmatrix, "x + rate", {"x": [1, 2, 3], "rate": 1.5})
+    # ...but all-scalar data still gives a 1-row matrix in default mode:
+    assert np.allclose(dmatrix("x1 + x2", {"x1": 1.1, "x2": 1.2}), [[1, 1.1, 1.2]])
+
+
+def test_scalar_broadcast_NA():
+    # A scalar NA marks the whole batch as missing:
+    m = dmatrix("x + rate", {"x": [1, 2, 3], "rate": np.nan}, scalar_broadcast=True)
+    assert m.shape == (0, 3)
+    pytest.raises(
+        PatsyError,
+        dmatrix,
+        "x + rate",
+        {"x": [1, 2, 3], "rate": np.nan},
+        0,
+        "raise",
+        "matrix",
+        True,
+    )
+    m = dmatrix(
+        "x + C(tag, levels=['a', 'b'])",
+        {"x": [1, 2, 3], "tag": None},
+        scalar_broadcast=True,
+    )
+    assert m.shape == (0, 3)
+    # NAs in per-row factors drop the same rows from response and features:
+    y, X = dmatrices(
+        "y ~ x + rate",
+        {"y": [1.0, np.nan, 3.0], "x": [1, 2, 3], "rate": 2.0},
+        scalar_broadcast=True,
+    )
+    assert y.shape == (2, 1)
+    assert X.shape == (2, 3)
+    assert np.allclose(y, [[1.0], [3.0]])
+
+
+def test_scalar_broadcast_pandas():
+    if not have_pandas:
+        return
+    # A DataFrame pins down the row count for scalars coming from the
+    # evaluation environment:
+    rate = 3.0
+    df = pandas.DataFrame({"x": [1.0, 2.0]})
+    m = dmatrix("rate", df, scalar_broadcast=True)
+    assert m.design_info.column_names == ["Intercept", "rate"]
+    assert m.shape == (2, 2)
+    assert np.allclose(np.asarray(m)[:, 1], 3.0)
+    # Indexes are preserved, and duplicate indexes don't cause any
+    # index-based realignment of the broadcast values:
+    df_dup = pandas.DataFrame({"x": [1.0, 2.0, 3.0]}, index=[0, 0, 1])
+    m = dmatrix("x + rate", df_dup, scalar_broadcast=True, return_type="dataframe")
+    assert list(m.index) == [0, 0, 1]
+    assert np.allclose(m["x"], [1.0, 2.0, 3.0])
+    assert np.allclose(m["rate"], [3.0, 3.0, 3.0])
+    # A scalar NA drops the whole batch, index included:
+    rate = np.nan
+    m = dmatrix("x + rate", df_dup, scalar_broadcast=True, return_type="dataframe")
+    assert m.shape == (0, 3)
+    assert list(m.index) == []
+
+
+def test_scalar_broadcast_incremental():
+    # The intended use case: batch-level parameters (one scalar per batch)
+    # participating in the design, with the row count re-determined for
+    # every batch.
+    batches = [
+        {"x": [1.0, 2.0, 3.0], "y": [2.0, 4.0, 6.0], "rate": 1.5},
+        {"x": [4.0, 5.0], "y": [8.0, 10.0], "rate": 2.0},
+    ]
+
+    def iter_maker():
+        return iter(batches)
+
+    lhs_di, rhs_di = incr_dbuilders("y ~ x + rate", iter_maker, scalar_broadcast=True)
+    assert lhs_di.scalar_broadcast is True
+    assert rhs_di.scalar_broadcast is True
+    for batch, exp_rows, exp_rate in [(batches[0], 3, 1.5), (batches[1], 2, 2.0)]:
+        y, X = build_design_matrices([lhs_di, rhs_di], batch)
+        assert y.shape == (exp_rows, 1)
+        assert X.shape == (exp_rows, 3)
+        assert np.allclose(np.asarray(X)[:, 2], exp_rate)
+    # Categorical levels are collected across batches, one scalar at a time:
+    tag_batches = [
+        {"x": [1, 2], "tag": "a"},
+        {"x": [3, 4, 5], "tag": "b"},
+    ]
+
+    def tag_iter_maker():
+        return iter(tag_batches)
+
+    di = incr_dbuilder("~ x + C(tag)", tag_iter_maker, scalar_broadcast=True)
+    assert di.column_names == ["Intercept", "C(tag)[T.b]", "x"]
+    m = build_design_matrices([di], {"x": [9, 9], "tag": "b"})[0]
+    assert np.allclose(m, [[1, 1, 9], [1, 1, 9]])
+    # A batch whose tag is missing drops out entirely:
+    m = build_design_matrices([di], {"x": [9, 9, 9], "tag": None})[0]
+    assert m.shape == (0, 3)

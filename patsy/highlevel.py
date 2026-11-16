@@ -28,10 +28,14 @@ if have_pandas:
 # Tries to build a (lhs, rhs) design given a formula_like and an incremental
 # data source. If formula_like is not capable of doing this, then returns
 # None.
-def _try_incr_builders(formula_like, data_iter_maker, eval_env, NA_action):
+def _try_incr_builders(
+    formula_like, data_iter_maker, eval_env, NA_action, scalar_broadcast
+):
     if isinstance(formula_like, DesignInfo):
         return (
-            design_matrix_builders([[]], data_iter_maker, eval_env, NA_action)[0],
+            design_matrix_builders(
+                [[]], data_iter_maker, eval_env, NA_action, scalar_broadcast
+            )[0],
             formula_like,
         )
     if (
@@ -58,12 +62,15 @@ def _try_incr_builders(formula_like, data_iter_maker, eval_env, NA_action):
             data_iter_maker,
             eval_env,
             NA_action,
+            scalar_broadcast,
         )
     else:
         return None
 
 
-def incr_dbuilder(formula_like, data_iter_maker, eval_env=0, NA_action="drop"):
+def incr_dbuilder(
+    formula_like, data_iter_maker, eval_env=0, NA_action="drop", scalar_broadcast=False
+):
     """Construct a design matrix builder incrementally from a large data set.
 
     :arg formula_like: Similar to :func:`dmatrix`, except that explicit
@@ -86,6 +93,11 @@ def incr_dbuilder(formula_like, data_iter_maker, eval_env=0, NA_action="drop"):
     :arg NA_action: An :class:`NAAction` object or string, used to determine
       what values count as 'missing' for purposes of determining the levels of
       categorical factors.
+    :arg scalar_broadcast: If True, enable scalar broadcast mode: factors
+      which evaluate to genuine scalars (numbers, booleans, strings, or
+      :func:`C` objects wrapping such values) are treated as batch-level
+      values and broadcast out to the number of rows in each batch of data.
+      See :func:`build_design_matrices` for details.
     :returns: A :class:`DesignInfo`
 
     Tip: for `data_iter_maker`, write a generator like::
@@ -98,10 +110,12 @@ def incr_dbuilder(formula_like, data_iter_maker, eval_env=0, NA_action="drop"):
 
     .. versionadded:: 0.2.0
        The ``NA_action`` argument.
+    .. versionadded:: 1.0.4
+       The ``scalar_broadcast`` argument.
     """
     eval_env = EvalEnvironment.capture(eval_env, reference=1)
     design_infos = _try_incr_builders(
-        formula_like, data_iter_maker, eval_env, NA_action
+        formula_like, data_iter_maker, eval_env, NA_action, scalar_broadcast
     )
     if design_infos is None:
         raise PatsyError("bad formula-like object")
@@ -112,7 +126,9 @@ def incr_dbuilder(formula_like, data_iter_maker, eval_env=0, NA_action="drop"):
     return design_infos[1]
 
 
-def incr_dbuilders(formula_like, data_iter_maker, eval_env=0, NA_action="drop"):
+def incr_dbuilders(
+    formula_like, data_iter_maker, eval_env=0, NA_action="drop", scalar_broadcast=False
+):
     """Construct two design matrix builders incrementally from a large data
     set.
 
@@ -121,7 +137,7 @@ def incr_dbuilders(formula_like, data_iter_maker, eval_env=0, NA_action="drop"):
     """
     eval_env = EvalEnvironment.capture(eval_env, reference=1)
     design_infos = _try_incr_builders(
-        formula_like, data_iter_maker, eval_env, NA_action
+        formula_like, data_iter_maker, eval_env, NA_action, scalar_broadcast
     )
     if design_infos is None:
         raise PatsyError("bad formula-like object")
@@ -147,7 +163,9 @@ def incr_dbuilders(formula_like, data_iter_maker, eval_env=0, NA_action="drop"):
 #   DesignInfo
 #   (DesignInfo, DesignInfo)
 #   any object with a special method __patsy_get_model_desc__
-def _do_highlevel_design(formula_like, data, eval_env, NA_action, return_type):
+def _do_highlevel_design(
+    formula_like, data, eval_env, NA_action, return_type, scalar_broadcast
+):
     if return_type == "dataframe" and not have_pandas:
         raise PatsyError("pandas.DataFrame was requested, but pandas is not installed")
     if return_type not in ("matrix", "dataframe"):
@@ -160,7 +178,7 @@ def _do_highlevel_design(formula_like, data, eval_env, NA_action, return_type):
         return iter([data])
 
     design_infos = _try_incr_builders(
-        formula_like, data_iter_maker, eval_env, NA_action
+        formula_like, data_iter_maker, eval_env, NA_action, scalar_broadcast
     )
     if design_infos is not None:
         return build_design_matrices(
@@ -227,7 +245,14 @@ def _do_highlevel_design(formula_like, data, eval_env, NA_action, return_type):
         return (lhs, rhs)
 
 
-def dmatrix(formula_like, data={}, eval_env=0, NA_action="drop", return_type="matrix"):
+def dmatrix(
+    formula_like,
+    data={},
+    eval_env=0,
+    NA_action="drop",
+    return_type="matrix",
+    scalar_broadcast=False,
+):
     """Construct a single design matrix given a formula_like and data.
 
     :arg formula_like: An object that can be used to construct a design
@@ -247,6 +272,16 @@ def dmatrix(formula_like, data={}, eval_env=0, NA_action="drop", return_type="ma
       :class:`NAAction` object. See :class:`NAAction` for details on what
       values count as 'missing' (and how to alter this).
     :arg return_type: Either ``"matrix"`` or ``"dataframe"``. See below.
+    :arg scalar_broadcast: If True, enable scalar broadcast mode: factors
+      which evaluate to genuine scalars (numbers, booleans, strings, or
+      :func:`C` objects wrapping such values -- but not 1-element arrays or
+      1-row matrices) are treated as batch-level values and broadcast out to
+      the number of rows in the current batch of data, exactly as if the
+      scalar had been explicitly repeated once per row. The setting is
+      recorded on the returned :class:`DesignInfo`, so it also applies when
+      that object (or a subset of it) is later passed to
+      :func:`build_design_matrices`, with the row count re-determined from
+      each new batch of data. See :func:`build_design_matrices` for details.
 
     The `formula_like` can take a variety of forms. You can use any of the
     following:
@@ -289,10 +324,12 @@ def dmatrix(formula_like, data={}, eval_env=0, NA_action="drop", return_type="ma
 
     .. versionadded:: 0.2.0
        The ``NA_action`` argument.
+    .. versionadded:: 1.0.4
+       The ``scalar_broadcast`` argument.
     """
     eval_env = EvalEnvironment.capture(eval_env, reference=1)
     (lhs, rhs) = _do_highlevel_design(
-        formula_like, data, eval_env, NA_action, return_type
+        formula_like, data, eval_env, NA_action, return_type, scalar_broadcast
     )
     if lhs.shape[1] != 0:
         raise PatsyError(
@@ -302,7 +339,12 @@ def dmatrix(formula_like, data={}, eval_env=0, NA_action="drop", return_type="ma
 
 
 def dmatrices(
-    formula_like, data={}, eval_env=0, NA_action="drop", return_type="matrix"
+    formula_like,
+    data={},
+    eval_env=0,
+    NA_action="drop",
+    return_type="matrix",
+    scalar_broadcast=False,
 ):
     """Construct two design matrices given a formula_like and data.
 
@@ -315,7 +357,7 @@ def dmatrices(
     """
     eval_env = EvalEnvironment.capture(eval_env, reference=1)
     (lhs, rhs) = _do_highlevel_design(
-        formula_like, data, eval_env, NA_action, return_type
+        formula_like, data, eval_env, NA_action, return_type, scalar_broadcast
     )
     if lhs.shape[1] == 0:
         raise PatsyError("model is missing required outcome variables")

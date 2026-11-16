@@ -271,12 +271,24 @@ class DesignInfo(object):
     processing like intelligent tests, prediction on new data, etc. Usually
     encountered as the `.design_info` attribute on design matrices.
 
+    .. attribute:: scalar_broadcast
+
+       Whether scalar broadcast mode is enabled for this design (see
+       :func:`design_matrix_builders` and :func:`build_design_matrices`).
+       This is recorded here when the design is created, so that later calls
+       to :func:`build_design_matrices` -- including calls on subsets of this
+       design's terms -- use the same semantics, with the number of rows
+       re-determined from each new batch of data.
+
     """
 
-    def __init__(self, column_names, factor_infos=None, term_codings=None):
+    def __init__(
+        self, column_names, factor_infos=None, term_codings=None, scalar_broadcast=False
+    ):
         self.column_name_indexes = OrderedDict(
             zip(column_names, range(len(column_names)))
         )
+        self.scalar_broadcast = scalar_broadcast
 
         if (factor_infos is None) != (term_codings is None):
             raise ValueError(
@@ -657,7 +669,7 @@ class DesignInfo(object):
             new_names = []
             for t in which_terms:
                 new_names += self.column_names[self.term_name_slices[t]]
-            return DesignInfo(new_names)
+            return DesignInfo(new_names, scalar_broadcast=self.scalar_broadcast)
         else:
             term_name_to_term = {}
             for term in self.term_codings:
@@ -678,6 +690,7 @@ class DesignInfo(object):
                 new_column_names,
                 factor_infos=new_factor_infos,
                 term_codings=new_term_codings,
+                scalar_broadcast=self.scalar_broadcast,
             )
 
     @classmethod

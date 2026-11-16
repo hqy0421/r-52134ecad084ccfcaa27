@@ -8,6 +8,22 @@ All Patsy releases are archived at Zenodo:
 .. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.592075.svg
    :target: https://doi.org/10.5281/zenodo.592075
 
+v1.0.4
+------
+
+* Added an optional scalar broadcast mode (``scalar_broadcast=True`` on
+  :func:`dmatrix`, :func:`dmatrices`, :func:`incr_dbuilder`,
+  :func:`incr_dbuilders`, and :func:`design_matrix_builders`). In this mode,
+  factors that evaluate to genuine scalars -- numbers, booleans, strings, or
+  ``C()`` objects wrapping such values -- are treated as batch-level values
+  and broadcast out to the number of rows in the current batch of data,
+  exactly as if the scalar had been explicitly repeated once per row. The
+  setting is recorded on the resulting :class:`DesignInfo` (and preserved by
+  :meth:`DesignInfo.subset`), so :func:`build_design_matrices` re-determines
+  the row count from each new batch of data. 1-element arrays and 1-row
+  matrices are not scalars and still follow the ordinary row-count rules,
+  and the default behavior is unchanged.
+
 v1.0.3
 ------
 

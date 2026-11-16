@@ -11,12 +11,18 @@ import itertools
 
 import numpy as np
 from patsy import PatsyError
-from patsy.categorical import guess_categorical, CategoricalSniffer, categorical_to_int
+from patsy.categorical import (
+    guess_categorical,
+    CategoricalSniffer,
+    categorical_to_int,
+    _CategoricalBox,
+)
 from patsy.util import (
     atleast_2d_column_default,
     have_pandas,
     asarray_or_pandas,
     safe_issubdtype,
+    iterable,
 )
 from patsy.design_info import DesignMatrix, DesignInfo, FactorInfo, SubtermInfo
 from patsy.redundancy import pick_contrasts_for_term
@@ -63,9 +69,75 @@ def test__max_allowed_dim():
     pytest.raises(PatsyError, _max_allowed_dim, 2, np.array([[[1]]]), f)
 
 
+def _is_scalar_factor_value(value):
+    # Detects "true" scalar factor results (as opposed to 1-element arrays or
+    # 1-row matrices, which follow the ordinary row-count rules). Used to
+    # implement the optional scalar broadcast mode: a scalar represents a
+    # single batch-level value that can be expanded to however many rows the
+    # rest of the batch has.
+    #
+    # Unbox C() wrappers to see what they actually contain:
+    if isinstance(value, _CategoricalBox):
+        value = value.data
+    # Strings and bytes are scalar (categorical) values, even though they are
+    # technically iterable.
+    if isinstance(value, (str, bytes)):
+        return True
+    # Anything that cannot be iterated over is a genuine scalar: Python
+    # scalars, numpy scalars, 0-d arrays, None, etc. Lists, tuples, 1-d (or
+    # higher) arrays, pandas objects, generators, etc. are all iterable and
+    # thus treated as ordinary per-row data -- even if they happen to contain
+    # only a single entry.
+    return not iterable(value)
+
+
+def test__is_scalar_factor_value():
+    from patsy.categorical import C
+
+    # True scalars:
+    for scalar in [
+        1,
+        1.5,
+        True,
+        None,
+        "a",
+        b"a",
+        np.float64(1.5),
+        np.array(1.5),
+        np.array("a"),
+        np.array(True),
+        C("a"),
+        C(1),
+        C(np.array(1.5)),
+        C(None),
+    ]:
+        assert _is_scalar_factor_value(scalar)
+    # Not scalars (ordinary per-row data, even if length 1):
+    for non_scalar in [
+        [1],
+        [1, 2],
+        (1,),
+        np.array([1.5]),
+        np.array([[1.5]]),
+        np.array(["a"]),
+        C(["a"]),
+        C([1]),
+        iter([1, 2]),
+    ]:
+        assert not _is_scalar_factor_value(non_scalar)
+    if have_pandas:
+        assert not _is_scalar_factor_value(pandas.Series([1.5]))
+        assert not _is_scalar_factor_value(pandas.DataFrame([[1.5]]))
+
+
 def _eval_factor(factor_info, data, NA_action):
     factor = factor_info.factor
     result = factor.eval(factor_info.state, data)
+    return _eval_factor_value(factor_info, result, NA_action)
+
+
+def _eval_factor_value(factor_info, result, NA_action):
+    factor = factor_info.factor
     # Returns either a 2d ndarray, or a DataFrame, plus is_NA mask
     if factor_info.type == "numerical":
         result = atleast_2d_column_default(result, preserve_pandas=True)
@@ -690,7 +762,9 @@ def _make_subterm_infos(terms, num_column_counts, cat_levels_contrasts):
     return term_to_subterm_infos
 
 
-def design_matrix_builders(termlists, data_iter_maker, eval_env, NA_action="drop"):
+def design_matrix_builders(
+    termlists, data_iter_maker, eval_env, NA_action="drop", scalar_broadcast=False
+):
     """Construct several :class:`DesignInfo` objects from termlists.
 
     This is one of Patsy's fundamental functions. This function and
@@ -715,6 +789,14 @@ def design_matrix_builders(termlists, data_iter_maker, eval_env, NA_action="drop
     :arg NA_action: An :class:`NAAction` object or string, used to determine
       what values count as 'missing' for purposes of determining the levels of
       categorical factors.
+    :arg scalar_broadcast: If True, then factors which evaluate to genuine
+      scalars (numbers, booleans, strings, or :func:`C` objects wrapping such
+      values -- but *not* 1-element arrays or 1-row matrices) are treated as
+      batch-level values: each time :func:`build_design_matrices` is called
+      on the returned :class:`DesignInfo` objects, such scalars are broadcast out
+      to however many rows that batch of data has. The setting is recorded on
+      the returned :class:`DesignInfo` objects. See
+      :func:`build_design_matrices` for details.
     :returns: A list of :class:`DesignInfo` objects, one for each
       termlist passed in.
 
@@ -728,6 +810,8 @@ def design_matrix_builders(termlists, data_iter_maker, eval_env, NA_action="drop
        The ``NA_action`` argument.
     .. versionadded:: 0.4.0
        The ``eval_env`` argument.
+    .. versionadded:: 1.0.4
+       The ``scalar_broadcast`` argument.
     """
     # People upgrading from versions prior to 0.4.0 could potentially have
     # passed NA_action as the 3rd positional argument. Fortunately
@@ -791,6 +875,7 @@ def design_matrix_builders(termlists, data_iter_maker, eval_env, NA_action="drop
                 column_names,
                 factor_infos=this_design_factor_infos,
                 term_codings=term_to_subterm_infos,
+                scalar_broadcast=scalar_broadcast,
             )
         )
     return design_infos
@@ -922,8 +1007,27 @@ def build_design_matrices(
     generate multiple design matrices at once, then they must all have the
     same number of rows.
 
+    Scalar broadcast mode: if any of the `design_infos` was created with
+    ``scalar_broadcast=True`` (see :func:`design_matrix_builders` and
+    :func:`dmatrix`), then factors which evaluate to genuine scalars --
+    numbers, booleans, strings, or :func:`C` objects wrapping such values --
+    are treated as batch-level values and broadcast out to the full number of
+    rows in this batch of data, exactly as if the scalar value had been
+    explicitly repeated once per row before building the matrix. (1-element
+    arrays and 1-row matrices are *not* scalars, and are still checked
+    against the ordinary row-count rules.) In this case the number of rows is
+    determined afresh on each call, from ``data`` (if it is a
+    :class:`pandas.DataFrame`) and/or from the non-scalar factors; if every
+    factor evaluates to a scalar and ``data`` is not a DataFrame, then the
+    number of rows cannot be determined and an error is raised. A scalar
+    missing value (e.g. ``NaN`` or ``None``) counts as missing for the whole
+    batch, and scalars carry no index, so they never interfere with index
+    checking.
+
     .. versionadded:: 0.2.0
        The ``NA_action`` argument.
+    .. versionadded:: 1.0.4
+       Scalar broadcast mode.
 
     """
     if isinstance(NA_action, str):
@@ -935,9 +1039,11 @@ def build_design_matrices(
             "unrecognized output type %r, should be "
             "'matrix' or 'dataframe'" % (return_type,)
         )
+    scalar_broadcast = any(design_info.scalar_broadcast for design_info in design_infos)
     # Evaluate factors
     factor_info_to_values = {}
     factor_info_to_isNAs = {}
+    scalar_factor_infos = []
     rows_checker = _CheckMatch("Number of rows", lambda a, b: a == b)
     index_checker = _CheckMatch("Index", lambda a, b: a.equals(b))
     if have_pandas and isinstance(data, pandas.DataFrame):
@@ -949,9 +1055,24 @@ def build_design_matrices(
         # memorized state.
         for factor_info in design_info.factor_infos.values():
             if factor_info not in factor_info_to_values:
-                value, is_NA = _eval_factor(factor_info, data, NA_action)
+                is_scalar = False
+                if scalar_broadcast:
+                    # Evaluate the factor first, so that we can tell genuine
+                    # scalars apart from 1-element arrays and 1-row matrices.
+                    raw_value = factor_info.factor.eval(factor_info.state, data)
+                    is_scalar = _is_scalar_factor_value(raw_value)
+                    value, is_NA = _eval_factor_value(factor_info, raw_value, NA_action)
+                else:
+                    value, is_NA = _eval_factor(factor_info, data, NA_action)
                 factor_info_to_isNAs[factor_info] = is_NA
                 # value may now be a Series, DataFrame, or ndarray
+                if is_scalar:
+                    # A batch-level scalar: it has no rows (and no index) of
+                    # its own, so it skips the row-count and index checks and
+                    # is broadcast to the batch size below.
+                    scalar_factor_infos.append(factor_info)
+                    factor_info_to_values[factor_info] = np.asarray(value)
+                    continue
                 name = factor_info.factor.name()
                 origin = factor_info.factor.origin
                 rows_checker.check(value.shape[0], name, origin)
@@ -965,6 +1086,26 @@ def build_design_matrices(
                 # categories).
                 value = np.asarray(value)
                 factor_info_to_values[factor_info] = value
+    # Broadcast any scalar factor values to this batch's row count. The row
+    # count comes from the data DataFrame and/or the ordinary per-row
+    # factors, exactly as if each scalar had been explicitly repeated that
+    # many times in the input data.
+    if scalar_factor_infos:
+        if rows_checker.value is None:
+            raise PatsyError(
+                "All factors evaluate to scalars, and the data object is "
+                "not a DataFrame. I can't tell how many rows the design "
+                "matrix should have!"
+            )
+        num_rows = rows_checker.value
+        for factor_info in scalar_factor_infos:
+            value = factor_info_to_values[factor_info]
+            is_NA = factor_info_to_isNAs[factor_info]
+            # value has 1 row (shape (1, 1) for numerical factors, (1,) for
+            # categorical ones); is_NA has 1 entry. A scalar NA marks the
+            # whole batch as missing.
+            factor_info_to_values[factor_info] = np.repeat(value, num_rows, axis=0)
+            factor_info_to_isNAs[factor_info] = np.repeat(is_NA, num_rows)
     # Handle NAs
     values = list(factor_info_to_values.values())
     is_NAs = list(factor_info_to_isNAs.values())

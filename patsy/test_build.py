@@ -796,3 +796,242 @@ def test_DesignInfo_subset():
     min_di_subset = min_di.subset(["c", "a"])
     assert min_di_subset.column_names == ["c", "a"]
     assert min_di_subset.terms is None
+
+
+def _broadcast_design_info(data, entries, scalar_broadcast=True):
+    termlist = make_termlist(*entries)
+
+    def iter_maker():
+        yield data
+
+    (design_info,) = design_matrix_builders(
+        [termlist], iter_maker, eval_env=0, scalar_broadcast=scalar_broadcast
+    )
+    return design_info
+
+
+def test_scalar_broadcast_basic():
+    # A genuine scalar factor result is expanded to the batch's row count,
+    # exactly as if it had been explicitly repeated once per row.
+    di = _broadcast_design_info({"x": [1, 2, 3], "rate": 2.5}, [[], ["x"], ["rate"]])
+    assert di.scalar_broadcast is True
+    m = build_design_matrices([di], {"x": [1, 2, 3], "rate": 2.5})[0]
+    assert m.design_info.column_names == ["Intercept", "x", "rate"]
+    assert np.allclose(m, [[1, 1, 2.5], [1, 2, 2.5], [1, 3, 2.5]])
+    # The row count is re-determined on every call:
+    m2 = build_design_matrices([di], {"x": [1, 2, 3, 4, 5], "rate": 0.5})[0]
+    assert m2.shape == (5, 3)
+    assert np.allclose(np.asarray(m2)[:, 2], 0.5)
+    # With the default mode, the very same scalar does not broadcast:
+    di_off = _broadcast_design_info(
+        {"x": [1, 2, 3], "rate": 2.5}, [[], ["x"], ["rate"]], scalar_broadcast=False
+    )
+    assert di_off.scalar_broadcast is False
+    pytest.raises(
+        PatsyError,
+        build_design_matrices,
+        [di_off],
+        {"x": [1, 2, 3], "rate": 2.5},
+    )
+
+
+def test_scalar_broadcast_equivalent_to_repeat():
+    # Broadcasting scalars gives the same matrix as explicitly repeating the
+    # values and building in the ordinary way -- for numeric, boolean, and
+    # categorical scalars alike, including interactions with per-row factors.
+    entries = [[], ["x"], ["rate"], ["flag"], ["tag"], ["x", "rate"]]
+    data_scalar = {"x": [1, 2, 3], "rate": 2.5, "flag": True, "tag": "b"}
+    data_repeated = {
+        "x": [1, 2, 3],
+        "rate": [2.5, 2.5, 2.5],
+        "flag": [True, True, True],
+        "tag": ["b", "b", "b"],
+    }
+    di_scalar = _broadcast_design_info(data_scalar, entries)
+    di_repeated = _broadcast_design_info(data_repeated, entries, scalar_broadcast=False)
+    m_scalar = build_design_matrices([di_scalar], data_scalar)[0]
+    m_repeated = build_design_matrices([di_repeated], data_repeated)[0]
+    assert m_scalar.design_info.column_names == m_repeated.design_info.column_names
+    assert np.allclose(m_scalar, m_repeated)
+
+
+def test_scalar_broadcast_scalar_detection():
+    # Only genuine scalars broadcast: Python/numpy scalars and 0-d arrays.
+    # 1-element arrays and 1-row matrices still follow the ordinary row-count
+    # rules (and thus fail to combine with a 3-row factor).
+    di = _broadcast_design_info({"x": [1, 2, 3], "rate": 2.5}, [[], ["x"], ["rate"]])
+    for scalar in [2.5, np.float64(2.5), np.array(2.5)]:
+        m = build_design_matrices([di], {"x": [1, 2, 3], "rate": scalar})[0]
+        assert m.shape == (3, 3)
+    for non_scalar in [[2.5], np.array([2.5]), [[2.5]], np.array([[2.5]])]:
+        pytest.raises(
+            PatsyError,
+            build_design_matrices,
+            [di],
+            {"x": [1, 2, 3], "rate": non_scalar},
+        )
+    if have_pandas:
+        pytest.raises(
+            PatsyError,
+            build_design_matrices,
+            [di],
+            {"x": [1, 2, 3], "rate": pandas.Series([2.5])},
+        )
+
+
+def test_scalar_broadcast_no_row_source():
+    # If every factor evaluates to a scalar and the data object is not a
+    # DataFrame, then the number of rows cannot be determined.
+    di = _broadcast_design_info({"rate": 2.5}, [[], ["rate"]])
+    pytest.raises(PatsyError, build_design_matrices, [di], {"rate": 2.5})
+    pytest.raises(PatsyError, build_design_matrices, [di], {"rate": 2.5, "x": 1.0})
+    # A pandas Series is dict-like but not a DataFrame, so it doesn't count
+    # as a row source either:
+    if have_pandas:
+        pytest.raises(
+            PatsyError,
+            build_design_matrices,
+            [di],
+            pandas.Series({"rate": 2.5}),
+        )
+
+
+def test_scalar_broadcast_subset():
+    # subset() preserves the scalar broadcast semantics of the design it
+    # was derived from.
+    di = _broadcast_design_info({"x": [1, 2, 3], "rate": 2.5}, [[], ["x"], ["rate"]])
+    sub = di.subset("0 + x + rate")
+    assert sub.scalar_broadcast is True
+    m = build_design_matrices([sub], {"x": [1, 2], "rate": 3.5})[0]
+    assert m.design_info.column_names == ["x", "rate"]
+    assert np.allclose(m, [[1, 3.5], [2, 3.5]])
+    di_off = _broadcast_design_info(
+        {"x": [1, 2, 3], "rate": [2.5, 2.5, 2.5]},
+        [[], ["x"], ["rate"]],
+        scalar_broadcast=False,
+    )
+    assert di_off.subset("0 + x + rate").scalar_broadcast is False
+    # Minimal DesignInfo objects (column names only) default to off:
+    min_di = DesignInfo(["a", "b"])
+    assert min_di.scalar_broadcast is False
+    assert min_di.subset(["a"]).scalar_broadcast is False
+
+
+def test_scalar_broadcast_NA():
+    # A scalar NA marks the whole batch as missing.
+    di = _broadcast_design_info({"x": [1, 2, 3], "rate": 2.5}, [[], ["x"], ["rate"]])
+    m = build_design_matrices([di], {"x": [1, 2, 3], "rate": np.nan})[0]
+    assert m.shape == (0, 3)
+    pytest.raises(
+        PatsyError,
+        build_design_matrices,
+        [di],
+        {"x": [1, 2, 3], "rate": np.nan},
+        NA_action="raise",
+    )
+    # Same for a categorical scalar NA:
+    termlist = [
+        Term([]),
+        Term([LookupFactor("x")]),
+        Term([LookupFactor("tag", force_categorical=True, levels=("a", "b"))]),
+    ]
+
+    def iter_maker():
+        yield {"x": [1, 2, 3], "tag": "b"}
+
+    (cat_di,) = design_matrix_builders(
+        [termlist], iter_maker, eval_env=0, scalar_broadcast=True
+    )
+    assert cat_di.column_names == ["Intercept", "tag[T.b]", "x"]
+    m = build_design_matrices([cat_di], {"x": [1, 2, 3], "tag": None})[0]
+    assert m.shape == (0, 3)
+    # ...while a non-missing scalar still broadcasts:
+    m = build_design_matrices([cat_di], {"x": [1, 2, 3], "tag": "a"})[0]
+    assert m.shape == (3, 3)
+    assert np.allclose(np.asarray(m)[:, 1], [0, 0, 0])  # tag[T.b] column
+    assert np.allclose(np.asarray(m)[:, 2], [1, 2, 3])  # x column
+
+
+def test_scalar_broadcast_NA_and_index_consistency():
+    # NA handling and indexes stay consistent across simultaneously built
+    # matrices (e.g. response and predictors).
+    y_termlist = make_termlist(["y"])
+    x_termlist = make_termlist([], ["x"], ["rate"])
+
+    def iter_maker():
+        yield {"y": [1.0, 2.0, 3.0], "x": [1, 2, 3], "rate": 2.0}
+
+    di_y, di_x = design_matrix_builders(
+        [y_termlist, x_termlist], iter_maker, eval_env=0, scalar_broadcast=True
+    )
+    data = {"y": [1.0, np.nan, 3.0], "x": [1, 2, 3], "rate": 2.0}
+    m_y, m_x = build_design_matrices([di_y, di_x], data)
+    assert m_y.shape == (2, 1)
+    assert m_x.shape == (2, 3)
+    assert np.allclose(m_y, [[1.0], [3.0]])
+    assert np.allclose(np.asarray(m_x)[:, 1], [1, 3])
+    if have_pandas:
+        # A scalar has no index, so it never interferes with index checking,
+        # and the surviving index is tracked through NA dropping:
+        s_data = {
+            "y": pandas.Series([1.0, np.nan, 3.0], index=[10, 20, 30]),
+            "x": pandas.Series([1, 2, 3], index=[10, 20, 30]),
+            "rate": 2.0,
+        }
+        df_y, df_x = build_design_matrices(
+            [di_y, di_x], s_data, return_type="dataframe"
+        )
+        assert list(df_y.index) == [10, 30]
+        assert list(df_x.index) == [10, 30]
+        assert np.allclose(df_x["rate"], [2.0, 2.0])
+
+
+def test_scalar_broadcast_pandas_duplicate_index():
+    # Broadcasting is purely positional: duplicate index values do not cause
+    # any index-based realignment.
+    if not have_pandas:
+        return
+    di = _broadcast_design_info({"x": [1, 2, 3], "rate": 2.5}, [[], ["x"], ["rate"]])
+    data = {
+        "x": pandas.Series([1.0, 2.0, 3.0], index=[0, 0, 1]),
+        "rate": 7.0,
+    }
+    m = build_design_matrices([di], data, return_type="dataframe")[0]
+    assert list(m.index) == [0, 0, 1]
+    assert np.allclose(m["x"], [1.0, 2.0, 3.0])
+    assert np.allclose(m["rate"], [7.0, 7.0, 7.0])
+    # Also with a DataFrame as the data argument:
+    df = pandas.DataFrame(
+        {"x": [1.0, 2.0, 3.0], "rate": [7.0, 7.0, 7.0]}, index=[0, 0, 1]
+    )
+    m2 = build_design_matrices([di], df, return_type="dataframe")[0]
+    assert list(m2.index) == [0, 0, 1]
+    assert np.allclose(m2["rate"], [7.0, 7.0, 7.0])
+
+
+def test_scalar_broadcast_categorical_levels():
+    # Categorical scalar levels are sniffed batch-by-batch at fit time, and
+    # the encoding of a scalar at build time matches the fitted levels.
+    termlist = [
+        Term([]),
+        Term([LookupFactor("x")]),
+        Term([LookupFactor("tag", force_categorical=True)]),
+    ]
+    batches = [
+        {"x": [1, 2], "tag": "a"},
+        {"x": [3, 4, 5], "tag": "b"},
+    ]
+
+    def iter_maker():
+        return iter(batches)
+
+    (di,) = design_matrix_builders(
+        [termlist], iter_maker, eval_env=0, scalar_broadcast=True
+    )
+    assert di.column_names == ["Intercept", "tag[T.b]", "x"]
+    m = build_design_matrices([di], {"x": [9, 9], "tag": "b"})[0]
+    assert np.allclose(m, [[1, 1, 9], [1, 1, 9]])
+    m = build_design_matrices([di], {"x": [9, 9, 9, 9], "tag": "a"})[0]
+    assert np.allclose(m, [[1, 0, 9], [1, 0, 9], [1, 0, 9], [1, 0, 9]])
+    # An unseen level is still an error:
+    pytest.raises(PatsyError, build_design_matrices, [di], {"x": [1], "tag": "c"})
